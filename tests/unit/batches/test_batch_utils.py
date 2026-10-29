@@ -3406,3 +3406,21 @@ def test_invalid_batch_envelopes_preserve_recoverable_cost(
     assert result.usage.prompt_tokens == (200 if include_valid else 0)
     assert result.usage.completion_tokens == (40 if include_valid else 0)
     assert (result.successful_requests, result.failed_requests) == (2 if include_valid else 0, 1)
+
+
+def test_unpriced_batch_retains_reported_usage_by_model_and_marks_missing_usage():
+    rows: Final = [
+        _success_row(model="unregistered-batch-model-a", usage=_usage(4, 2)),
+        _success_row(model="unregistered-batch-model-a", usage=_usage(3, 1)),
+        _success_row(model="unregistered-batch-model-b", usage=_usage(5, 2)),
+        {"response": {"status_code": 200, "body": {"model": "unregistered-batch-model-c"}}},
+    ]
+    result: Final = bu.batch_cost_and_usage(rows, "openai")
+    captured: Final = result.usage.model_dump()
+    assert (result.usage.prompt_tokens, result.usage.completion_tokens) == (12, 5)
+    assert result.cost == 0
+    by_model: Final = captured["batch_usage_by_model"]
+    assert by_model["unregistered-batch-model-a"]["total_tokens"] == 10
+    assert by_model["unregistered-batch-model-b"]["total_tokens"] == 7
+    assert by_model["unregistered-batch-model-c"] is None
+    assert captured["batch_unknown_usage_requests"] == 1
