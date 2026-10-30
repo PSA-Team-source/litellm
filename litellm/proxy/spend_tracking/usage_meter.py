@@ -12,7 +12,6 @@ from itertools import accumulate, chain, count, takewhile
 from threading import Lock
 from typing import TYPE_CHECKING, Final
 
-from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter
 
 from litellm._logging import verbose_proxy_logger
@@ -48,9 +47,10 @@ class UsageCaptureError(RuntimeError):
     pass
 
 
-class UsageAcknowledgementError(HTTPException):
-    def __init__(self) -> None:
-        super().__init__(503, "Usage persistence did not acknowledge commit")
+class UsageAcknowledgementError(UsageCaptureError):
+    def __init__(self, cause: Exception) -> None:
+        super().__init__("Usage persistence did not acknowledge commit")
+        self.__cause__ = cause
 
 
 @dataclass(frozen=True, slots=True)
@@ -714,12 +714,16 @@ def validate_sync_ack_request(
     if settings.get("accounting_sync_ack") is not True:
         return
     if streaming or background or call_type not in {"acompletion", "atext_completion", "aembedding", "aresponses"}:
+        from fastapi import HTTPException
+
         raise HTTPException(
             400, "accounting_sync_ack supports foreground non-stream chat, text, embedding and Responses requests"
         )
 
 
 async def capture_proxy_response(logging_obj: object, response: object) -> None:
+    from fastapi import HTTPException
+
     from litellm.litellm_core_utils.litellm_logging import Logging
     from litellm.proxy.proxy_server import general_settings, usage_capture
 
@@ -744,7 +748,8 @@ async def capture_proxy_response(logging_obj: object, response: object) -> None:
             settings.get("accounting_sync_ack") is True
             and settings.get("accounting_sync_ack_failure_policy", "fail_closed") == "fail_closed"
         ):
-            raise UsageAcknowledgementError() from error
+            acknowledgement: Final = UsageAcknowledgementError(error)
+            raise HTTPException(503, str(acknowledgement)) from acknowledgement
 
 
 def capture_logging_usage(
