@@ -5,13 +5,14 @@ import json
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
-from itertools import accumulate, chain, takewhile
+from itertools import accumulate, chain, count, takewhile
 from threading import Lock
 from typing import TYPE_CHECKING, Final
 
+from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter
 
 from litellm._logging import verbose_proxy_logger
@@ -47,6 +48,11 @@ class UsageCaptureError(RuntimeError):
     pass
 
 
+class UsageAcknowledgementError(HTTPException):
+    def __init__(self) -> None:
+        super().__init__(503, "Usage persistence did not acknowledge commit")
+
+
 @dataclass(frozen=True, slots=True)
 class _Pending:
     writes: tuple[UsageWrite, ...]
@@ -67,6 +73,21 @@ def _report_failure(receipt: Future[None]) -> None:
         verbose_proxy_logger.error("Usage capture did not acknowledge commit", exc_info=receipt.exception())
 
 
+def _retryable_persistence_failure(error: Exception) -> bool:
+    from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler, exception_chain
+
+    outage: Final = PrismaDBExceptionHandler.find_database_service_unavailable_error_in_chain(error)
+    return (outage is not None and not PrismaDBExceptionHandler.is_permanent_database_fault(outage)) or any(
+        isinstance(cause, Exception)
+        and (
+            PrismaDBExceptionHandler.is_deadlock_error(cause)
+            or PrismaDBExceptionHandler.is_lock_timeout_error(cause)
+            or PrismaDBExceptionHandler.postgres_sqlstate(cause) == "40001"
+        )
+        for cause in exception_chain(error)
+    )
+
+
 class DurableUsageMeter:
     def __init__(
         self,
@@ -74,10 +95,12 @@ class DurableUsageMeter:
         settings: UsageCaptureSettings,
         *,
         wait_for_batch: Callable[[asyncio.Event, float], Awaitable[None]] = _wait_for_batch,
+        retry_delay: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._write_batch: Final = write_batch
         self.settings: Final = settings
         self._wait_for_batch: Final = wait_for_batch
+        self._retry_delay: Final = retry_delay
         self._loop: Final = asyncio.get_running_loop()
         self._admission: Final = Lock()
         self._queue: Final[deque[_Pending]] = deque()  # mutable-ok: one bounded producer/consumer queue
@@ -151,10 +174,22 @@ class DurableUsageMeter:
             count: Final = sum(1 for _ in takewhile(lambda size: size <= self.settings.batch_size, sizes))
             return tuple(self._queue.popleft() for _ in range(count))
 
+    async def _persist(self, writes: tuple[UsageWrite, ...]) -> None:
+        for attempt in count():
+            try:
+                await self._write_batch(writes)
+            except Exception as error:  # noqa: BLE001  # retry only classified database failures, preserving frozen writes
+                if not _retryable_persistence_failure(error):
+                    raise
+                verbose_proxy_logger.warning("Usage persistence unavailable; retaining admitted batch for retry")
+                await self._retry_delay(min(10.0, 0.2 * 2 ** min(attempt, 6)))
+            else:
+                return
+
     async def _commit(self, batch: tuple[_Pending, ...]) -> None:
         writes: Final = tuple(chain.from_iterable(item.writes for item in batch))
         try:
-            await self._write_batch(writes)
+            await self._persist(writes)
         except asyncio.CancelledError:
             self._finish(batch, UsageCaptureError("Usage commit acknowledgement interrupted"))
             raise
@@ -324,7 +359,7 @@ def usage_writes(
         ended_at=ended,
         outcome=outcome,
         dimensions=dimensions,
-        metrics=_usage_metrics(usage),
+        metrics=_usage_metrics(None if context.usage_source == "unknown" else usage),
     )
     envelope: Final = _json(
         {
@@ -583,6 +618,12 @@ def capture_context(payload: SpendLogsPayload, kwargs: Mapping[str, object], res
         else "{}",
         extra_dimensions=(
             *(
+                (Dimension(name=DimensionName.TOOL, value=tool_name),)
+                if not payload.get("mcp_namespaced_tool_name")
+                and (tool_name := _text(tool.get("namespaced_tool_name")))
+                else ()
+            ),
+            *(
                 (Dimension(name=DimensionName.API_BASE, value=mask_api_base_credentials(api_base)),)
                 if (api_base := _text(payload["api_base"]))
                 else ()
@@ -614,6 +655,9 @@ class _CaptureBuilder:
     def observe(self, payload: SpendLogsPayload, usage: str | None) -> None:
         parsed: Final = _JSON_OBJECT.validate_json(usage) if usage is not None else {}
         batch: Final = _fields(parsed.get("batch_usage_by_model"))
+        unknown: Final = (bool(batch) or bool(parsed.get("batch_unknown_usage_requests"))) and all(
+            value is None for value in batch.values()
+        )
         observed: Final = (
             _json(
                 {
@@ -621,10 +665,11 @@ class _CaptureBuilder:
                     "batch_unknown_usage_requests": parsed.get("batch_unknown_usage_requests"),
                 }
             )
-            if batch and all(value is None for value in batch.values())
+            if unknown
             else usage
         )
-        self.writes = usage_writes(payload, observed, capture_context(payload, self.kwargs, self.response))
+        context: Final = capture_context(payload, self.kwargs, self.response)
+        self.writes = usage_writes(payload, observed, replace(context, usage_source="unknown") if unknown else context)
 
 
 def capture_callback(
@@ -639,8 +684,6 @@ def capture_callback(
 
     existing: Final = kwargs.get("_accounting_capture")
     if isinstance(existing, CapturedUsage):
-        if existing.receipt.done() and (existing.receipt.cancelled() or existing.receipt.exception() is not None):
-            return CapturedUsage(existing.payload, existing.writes, meter.submit(existing.writes))
         return existing
     builder: Final = _CaptureBuilder(kwargs, response)
     payload: Final = get_logging_payload(
@@ -671,16 +714,12 @@ def validate_sync_ack_request(
     if settings.get("accounting_sync_ack") is not True:
         return
     if streaming or background or call_type not in {"acompletion", "atext_completion", "aembedding", "aresponses"}:
-        from fastapi import HTTPException
-
         raise HTTPException(
             400, "accounting_sync_ack supports foreground non-stream chat, text, embedding and Responses requests"
         )
 
 
 async def capture_proxy_response(logging_obj: object, response: object) -> None:
-    from fastapi import HTTPException
-
     from litellm.litellm_core_utils.litellm_logging import Logging
     from litellm.proxy.proxy_server import general_settings, usage_capture
 
@@ -705,7 +744,7 @@ async def capture_proxy_response(logging_obj: object, response: object) -> None:
             settings.get("accounting_sync_ack") is True
             and settings.get("accounting_sync_ack_failure_policy", "fail_closed") == "fail_closed"
         ):
-            raise HTTPException(503, "Usage persistence did not acknowledge commit") from error
+            raise UsageAcknowledgementError() from error
 
 
 def capture_logging_usage(

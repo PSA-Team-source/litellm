@@ -85,6 +85,13 @@ def _native_vertex_row_usage(
     return calculate_usage(completion_response)
 
 
+def native_vertex_batch_row_model(row: Mapping[str, object], model_name: str | None) -> str | None:
+    response: Final = row.get("response")
+    model_version: Final = response.get("modelVersion") if isinstance(response, Mapping) else None
+    deployment_model: Final = model_name if model_name and "*" not in model_name else None
+    return deployment_model or (model_version if isinstance(model_version, str) else model_name)
+
+
 def native_vertex_batch_row_stats(
     row: Mapping[str, object],
     model_name: str | None,
@@ -111,9 +118,7 @@ def native_vertex_batch_row_stats(
     if usage is None:
         return None
     total_tokens: Final = usage.total_tokens or (usage.prompt_tokens + usage.completion_tokens)
-    model_version: Final = response_body.get("modelVersion")
-    deployment_model: Final = model_name if model_name and "*" not in model_name else None
-    model: Final = deployment_model or (model_version if isinstance(model_version, str) else model_name)
+    model: Final = native_vertex_batch_row_model(row, model_name)
     if model is None:
         verbose_logger.warning(
             "vertex_ai batch output row could not be costed, so it is billed at $0 and the rest of the batch "

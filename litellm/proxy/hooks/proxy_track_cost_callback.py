@@ -592,8 +592,12 @@ class _ProxyDBLogger(CustomLogger):
         auth: UserAPIKeyAuth,
     ) -> None:
         from litellm.litellm_core_utils.litellm_logging import Logging
+        from litellm.proxy.db.exception_handler import exception_chain
         from litellm.proxy.proxy_server import usage_capture
+        from litellm.proxy.spend_tracking.usage_meter import UsageAcknowledgementError
 
+        if any(isinstance(error, UsageAcknowledgementError) for error in exception_chain(original_exception)):
+            return
         usage_meter: Final = usage_capture.meter
 
         if usage_meter is None:

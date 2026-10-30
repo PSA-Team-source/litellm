@@ -3424,3 +3424,32 @@ def test_unpriced_batch_retains_reported_usage_by_model_and_marks_missing_usage(
     assert by_model["unregistered-batch-model-b"]["total_tokens"] == 7
     assert by_model["unregistered-batch-model-c"] is None
     assert captured["batch_unknown_usage_requests"] == 1
+
+
+def test_batch_ocr_preserves_additive_page_quantities_without_changing_cost():
+    rows: Final = [
+        {
+            "response": {
+                "status_code": 200,
+                "body": {
+                    "model": "ocr-quantity-control",
+                    "usage_info": {"pages_processed": pages, "doc_size_bytes": size},
+                },
+            }
+        }
+        for pages, size in ((2, 100), (3, 200))
+    ]
+    result: Final = bu.batch_cost_and_usage(rows, "mistral", model_info={"ocr_cost_per_page_batches": 0.01})
+    captured: Final = result.usage.model_dump()["batch_usage_by_model"]["ocr-quantity-control"]
+    assert captured["pages_processed"] == 5
+    assert captured["doc_size_bytes"] == 300
+    assert result.cost == pytest.approx(5 * 0.01)
+
+
+def test_native_vertex_capture_retains_unknown_models_without_changing_legacy_counts():
+    rows: Final = [{"request": {}, "response": {"modelVersion": "missing-usage-model", "candidates": []}}]
+    result: Final = bu.calculate_vertex_ai_batch_cost_and_usage(rows)
+    captured: Final = result.usage.model_dump()
+    assert captured["batch_usage_by_model"] == {"missing-usage-model": None}
+    assert captured["batch_unknown_usage_requests"] == 1
+    assert (result.cost, result.successful_requests, result.failed_requests) == (0, 0, 1)

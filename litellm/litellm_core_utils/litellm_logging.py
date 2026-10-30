@@ -2523,7 +2523,10 @@ class Logging(LiteLLMLoggingBaseClass):
         )
         self.model_call_details["_accounting_usage_observed"] = (
             UsageObservation.KNOWN
-            if (self.model_call_details.get("combined_usage_object") or observed_response.get("usage"))
+            if (
+                self.model_call_details.get("combined_usage_object")
+                or StandardLoggingPayloadSetup.get_usage_as_dict(observed_response)
+            )
             else UsageObservation.UNKNOWN
         )
         prepared: Final = self.prepare_success_logging(
@@ -2849,7 +2852,7 @@ class Logging(LiteLLMLoggingBaseClass):
     _update_completion_start_time = update_completion_start_time
 
     def normalize_endpoint_logging_result(self, result: object) -> object:
-        call_type: Final = TypeAdapter(str).validate_python(self.call_type)
+        call_type: Final[object] = self.call_type
         if call_type == CallTypes.anthropic_messages.value:
             return self._anthropic_messages_logged_response(result=result)
         if call_type in (CallTypes.generate_content.value, CallTypes.agenerate_content.value):
@@ -6960,7 +6963,14 @@ class StandardLoggingPayloadSetup:
             return _empty
         _raw: Final = response_obj.get("usage", None)
         if _raw is None:
-            return _empty
+            reported: Final = response_obj.get("usage_info")
+            if isinstance(reported, BaseModel):
+                return reported.model_dump(exclude_none=True)
+            return (
+                {key: value for key, value in reported.items() if value is not None}
+                if isinstance(reported, dict)
+                else _empty
+            )
         if isinstance(_raw, ResponseAPIUsage):
             return ResponseAPILoggingUtils.transform_response_api_usage_to_chat_usage(_raw).model_dump()
         if isinstance(_raw, dict):

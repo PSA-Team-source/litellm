@@ -109,8 +109,8 @@ async def test_conflicting_group_rolls_back_and_valid_neighbor_still_commits() -
 
 
 @pytest.mark.asyncio
-async def test_persistence_failure_reaches_each_receipt_and_releases_capacity() -> None:
-    failure: Final = ConnectionError("commit acknowledgement unavailable")
+async def test_permanent_persistence_failure_reaches_each_receipt_and_releases_capacity() -> None:
+    failure: Final = ValueError("invalid envelope")
     database: Final = CommitBarrier(failure=failure)
     meter: Final = DurableUsageMeter(database.write, UsageCaptureSettings(batch_size=2))
     first: Final = meter.submit((_write("one"),))
@@ -424,7 +424,7 @@ async def test_sync_ack_commit_failure_follows_response_policy(
     from litellm.proxy.spend_tracking.usage_meter import UsageCaptureRuntime, capture_proxy_response
     from litellm.types.utils import ModelResponse, Usage
 
-    database: Final = CommitBarrier(failure=ConnectionError("database unavailable"))
+    database: Final = CommitBarrier(failure=ValueError("invalid envelope"))
     database.release.set()
     runtime: Final = UsageCaptureRuntime()
     runtime.start(database.write, UsageCaptureSettings(batch_size=2))
@@ -679,20 +679,35 @@ async def test_realtime_without_provider_token_usage_does_not_invent_zero(has_me
 
 
 @pytest.mark.asyncio
-async def test_lost_ack_retries_the_frozen_event_without_duplicate_rows() -> None:
+@pytest.mark.parametrize("committed_before_failure", [False, True])
+async def test_database_recovery_retries_frozen_usage_without_callback_or_duplicate_rows(
+    committed_before_failure: bool,
+) -> None:
     from litellm.proxy.spend_tracking.usage_meter import capture_callback
 
     database: Final = StoredUsage()
-    acknowledgements: Final = asyncio.Queue[None]()
-    acknowledgements.put_nowait(None)
+    failures: Final = asyncio.Queue[None]()
+    failures.put_nowait(None)
+    retrying: Final = asyncio.Event()
+    recovered: Final = asyncio.Event()
+    delays: Final = asyncio.Queue[float]()
 
     async def persist(writes: tuple[UsageWrite, ...]) -> None:
+        if not failures.empty():
+            failures.get_nowait()
+            if committed_before_failure:
+                await database.insert(writes)
+            raise ConnectionError("database unavailable or acknowledgement lost")
         await database.insert(writes)
-        if not acknowledgements.empty():
-            acknowledgements.get_nowait()
-            raise ConnectionError("commit acknowledgement lost")
 
-    meter: Final = DurableUsageMeter(persist, UsageCaptureSettings(), wait_for_batch=_manual_flush)
+    async def retry_delay(delay: float) -> None:
+        delays.put_nowait(delay)
+        retrying.set()
+        await recovered.wait()
+
+    meter: Final = DurableUsageMeter(
+        persist, UsageCaptureSettings(max_pending_records=2), wait_for_batch=_manual_flush, retry_delay=retry_delay
+    )
     kwargs: Final = {
         "call_type": "acompletion",
         "litellm_call_id": "caller",
@@ -701,13 +716,22 @@ async def test_lost_ack_retries_the_frozen_event_without_duplicate_rows() -> Non
     }
     response: Final = {"id": "provider", "usage": {"total_tokens": 3}}
     first: Final = capture_callback(meter, kwargs, response, NOW, NOW)
-    await meter.flush()
-    with pytest.raises(ConnectionError, match="acknowledgement lost"):
-        await first.receipt
-    retried: Final = capture_callback(meter, {**kwargs, "_accounting_capture": first}, response, NOW, NOW)
+    reserved: Final = meter.pending_bytes
+    flushing: Final = asyncio.create_task(meter.flush())
+    await retrying.wait()
+    assert not first.receipt.done()
+    assert (meter.pending_records, meter.pending_bytes) == (2, reserved)
+    with pytest.raises(UsageCaptureError, match="capacity"):
+        meter.submit((_write("overflow"),))
+    recovered.set()
+    await flushing
+    await first.receipt
+    duplicate: Final = capture_callback(meter, {**kwargs, "_accounting_capture": first}, response, NOW, NOW)
     await meter.close()
-    await retried.receipt
-    assert retried.writes == first.writes == database.rows
+    assert duplicate is first
+    assert database.rows == first.writes
+    assert delays.get_nowait() == 0.2
+    assert (meter.pending_records, meter.pending_bytes) == (0, 0)
 
 
 @pytest.mark.asyncio
@@ -869,3 +893,145 @@ async def test_billed_failure_is_captured_before_legacy_persistence_gates(monkey
     assert payload["usage"]["total_tokens"] == 3
     assert payload["charge_eligible"] is True
     assert payload["pricing"]["reported_cost"] == 0.2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pages", [None, 0, 3])
+async def test_prepared_ocr_capture_preserves_reported_pages(pages: int | None) -> None:
+    from litellm.llms.base_llm.ocr.transformation import OCRResponse, OCRUsageInfo
+    from litellm.proxy.spend_tracking.usage_meter import capture_logging_usage
+
+    database: Final = StoredUsage()
+    meter: Final = DurableUsageMeter(database.insert, UsageCaptureSettings(), wait_for_batch=_manual_flush)
+    logger: Final = _logger("aocr")
+    response: Final = OCRResponse(pages=[], model="capture-model", usage_info=OCRUsageInfo(pages_processed=pages))
+    logger.prepare_response_cost(response, NOW)
+    capture_logging_usage(meter, logger, response, NOW, NOW)
+    await meter.close()
+    envelope: Final = json.loads(database.rows[-1].envelope)
+    assert (None if envelope["usage"] is None else envelope["usage"]["pages_processed"]) == pages
+    assert envelope["usage_source"] == ("unknown" if pages is None else "measured")
+    assert response.usage_info is not None and response.usage_info.pages_processed == pages
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("measured", [None, {"total_tokens": 0}, {"total_tokens": 3}])
+async def test_batch_capture_provenance_tracks_observations_not_envelope_presence(
+    measured: Mapping[str, int] | None,
+) -> None:
+    from litellm.proxy.spend_tracking.usage_meter import capture_callback
+
+    database: Final = StoredUsage()
+    meter: Final = DurableUsageMeter(database.insert, UsageCaptureSettings(), wait_for_batch=_manual_flush)
+    usage: Final = {
+        "total_tokens": 0 if measured is None else measured["total_tokens"],
+        "batch_usage_by_model": {"missing-model": None, "other-model": measured},
+        "batch_unknown_usage_requests": 2 if measured is None else 1,
+    }
+    capture_callback(
+        meter,
+        {"call_type": "aretrieve_batch", "litellm_call_id": "caller", "litellm_params": {}},
+        {"id": "batch", "usage": usage},
+        NOW,
+        NOW,
+    )
+    await meter.close()
+    envelope: Final = json.loads(database.rows[-1].envelope)
+    assert envelope["usage_source"] == ("unknown" if measured is None else "measured")
+    assert envelope["usage"]["batch_usage_by_model"] == usage["batch_usage_by_model"]
+    assert database.rows[-1].event.metrics == (
+        None if measured is None else (Metric(name=MetricName.TOTAL_TOKENS, value=Decimal(measured["total_tokens"])),)
+    )
+
+
+@pytest.mark.asyncio
+async def test_ack_admission_failure_does_not_turn_provider_success_into_failed_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fastapi import HTTPException
+    from litellm.proxy import proxy_server
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.hooks.proxy_track_cost_callback import ProxyDBLogger
+    from litellm.proxy.spend_tracking.usage_meter import UsageCaptureRuntime, capture_proxy_response
+    from litellm.types.utils import ModelResponse, Usage
+
+    database: Final = StoredUsage()
+    runtime: Final = UsageCaptureRuntime()
+    runtime.start(database.insert, UsageCaptureSettings(batch_size=2, max_pending_records=2))
+    monkeypatch.setattr(proxy_server, "usage_capture", runtime)
+    monkeypatch.setattr(proxy_server, "general_settings", {"accounting_sync_ack": True})
+    monkeypatch.setattr(proxy_server, "prisma_client", None)
+    meter: Final = runtime.meter
+    assert meter is not None
+    logger: Final = _logger()
+    try:
+        meter.submit((_write("occupied-one"), _write("occupied-two")))
+        with pytest.raises(HTTPException) as error:
+            await capture_proxy_response(logger, ModelResponse(id="caller", usage=Usage(prompt_tokens=3)))
+        assert error.value.status_code == 503
+        await meter.flush()
+        request: Final = {**logger.model_call_details, "litellm_logging_obj": logger, "start_time": NOW}
+        await ProxyDBLogger().async_post_call_failure_hook(request, error.value, UserAPIKeyAuth())
+    finally:
+        await runtime.stop(1)
+    assert tuple(row.event.event_id for row in database.rows) == ("occupied-one", "occupied-two")
+
+
+@pytest.mark.asyncio
+async def test_response_ack_timeout_preserves_success_and_later_commits(monkeypatch: pytest.MonkeyPatch) -> None:
+    from fastapi import HTTPException
+    from litellm.proxy import proxy_server
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.hooks.proxy_track_cost_callback import ProxyDBLogger
+    from litellm.proxy.spend_tracking.usage_meter import UsageCaptureRuntime, capture_proxy_response
+    from litellm.types.utils import ModelResponse, Usage
+
+    database: Final = CommitBarrier()
+    runtime: Final = UsageCaptureRuntime()
+    runtime.start(database.write, UsageCaptureSettings(batch_size=2))
+    monkeypatch.setattr(proxy_server, "usage_capture", runtime)
+    monkeypatch.setattr(proxy_server, "prisma_client", None)
+    monkeypatch.setattr(proxy_server, "general_settings", {"accounting_sync_ack": True})
+    logger: Final = _logger()
+
+    async def expired_deadline(future: object, timeout: float) -> None:
+        raise TimeoutError("controlled response deadline")
+
+    try:
+        with monkeypatch.context() as clock:
+            clock.setattr(asyncio, "wait_for", expired_deadline)
+            with pytest.raises(HTTPException) as error:
+                await capture_proxy_response(logger, ModelResponse(id="provider", usage=Usage(prompt_tokens=3)))
+        assert error.value.status_code == 503
+        await database.entered.wait()
+        captured: Final = logger.model_call_details["_accounting_capture"]
+        request: Final = {**logger.model_call_details, "litellm_logging_obj": logger, "start_time": NOW}
+        await ProxyDBLogger().async_post_call_failure_hook(request, error.value, UserAPIKeyAuth())
+        database.release.set()
+        await captured.receipt
+        assert tuple(row.event.outcome for row in captured.writes) == (Outcome.SUCCEEDED, Outcome.SUCCEEDED)
+        assert database.committed == ("caller:inbound", "provider")
+        assert database.transactions == 1
+    finally:
+        await runtime.stop(1)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_during_database_backoff_releases_reserved_capacity() -> None:
+    retrying: Final = asyncio.Event()
+    blocked: Final = asyncio.Event()
+
+    async def unavailable(writes: tuple[UsageWrite, ...]) -> None:
+        raise ConnectionError("database unavailable")
+
+    async def backoff(delay: float) -> None:
+        retrying.set()
+        await blocked.wait()
+
+    meter: Final = DurableUsageMeter(unavailable, UsageCaptureSettings(batch_size=2), retry_delay=backoff)
+    receipt: Final = meter.submit((_write("one"), _write("two")))
+    await retrying.wait()
+    await meter.stop(0)
+    with pytest.raises(UsageCaptureError, match="interrupted"):
+        await receipt
+    assert (meter.pending_records, meter.pending_bytes) == (0, 0)

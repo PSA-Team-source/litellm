@@ -1640,7 +1640,9 @@ def _failure_fields_to_lift(
         (
             "_accounting_usage_observed",
             (
-                UsageObservation.UNKNOWN
+                None
+                if Logging.usage_capture_callback is None
+                else UsageObservation.UNKNOWN
                 if _usage_to_lift is None
                 else UsageObservation.KNOWN
                 if _model_call_details.get("combined_usage_object") is not None

@@ -779,9 +779,7 @@ def get_logging_payload(
         mcp_tool_call_metadata=(
             standard_logging_payload["metadata"].get("mcp_tool_call_metadata", None)
             if standard_logging_payload is not None
-            else TypeAdapter[StandardLoggingMCPToolCall | None](StandardLoggingMCPToolCall | None).validate_python(
-                kwargs.get("mcp_tool_call_metadata")
-            )
+            else None
         ),
         vector_store_request_metadata=(
             standard_logging_payload["metadata"].get("vector_store_request_metadata", None)

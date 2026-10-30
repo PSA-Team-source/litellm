@@ -6,7 +6,7 @@ from enum import Enum
 from itertools import groupby
 from typing import Any, Final, Literal, cast
 
-from pydantic import TypeAdapter
+from pydantic import JsonValue, TypeAdapter
 
 import litellm
 from litellm._logging import verbose_logger
@@ -16,6 +16,7 @@ from litellm.llms.base_llm.ocr.transformation import OCRUsageInfo
 from litellm.llms.bedrock.batches.transformation import titan_embedding_usage_from_batch_output
 from litellm.llms.vertex_ai.batches.transformation import (
     is_native_vertex_batch_output_row,
+    native_vertex_batch_row_model,
     native_vertex_batch_row_stats,
 )
 from litellm.types.llms.openai import Batch
@@ -290,8 +291,9 @@ def _compute_output_line_stats(
         reasoning_tokens=(completion_details.reasoning_tokens if completion_details else None) or 0,
         model=response_model or model_name,
         usage=(
-            usage.model_copy(update={"usage_info": ocr_usage.model_dump()})
+            usage.model_copy(update=ocr_usage.model_dump(exclude_none=True))
             if (ocr_usage := _ocr_usage_info_from_response_body(response_body)) is not None
+            and ocr_usage.model_dump(exclude_none=True)
             else usage
             if response_body.get("usage") is not None or usage.total_tokens > 0
             else None
@@ -329,7 +331,15 @@ def _combined_reported_batch_usage(usages: tuple[Usage | None, ...]) -> Mapping[
     from litellm.cost_calculator import BaseTokenUsageProcessor
 
     reported: Final = [usage for usage in usages if usage is not None]
-    return BaseTokenUsageProcessor.combine_usage_objects(usage_objects=reported).model_dump() if reported else None
+    if not reported:
+        return None
+    fields: Final = tuple(TypeAdapter(dict[str, JsonValue]).validate_python(usage.model_dump()) for usage in reported)
+    quantities: Final = {
+        key: sum(value for usage in fields if isinstance(value := usage.get(key), (int, float)))
+        for key in OCRUsageInfo.model_fields
+        if any(isinstance(usage.get(key), (int, float)) for usage in fields)
+    }
+    return {**BaseTokenUsageProcessor.combine_usage_objects(usage_objects=reported).model_dump(), **quantities}
 
 
 def _batch_usage_by_model(usages: tuple[tuple[str | None, Usage | None], ...]) -> Mapping[str, object]:
@@ -445,17 +455,21 @@ def calculate_vertex_ai_batch_cost_and_usage(
     from litellm.cost_calculator import batch_cost_calculator
     from litellm.llms.vertex_ai.gemini.vertex_and_google_ai_studio_gemini import VertexGeminiConfig
 
-    row_stats: Final = tuple(
-        native_vertex_batch_row_stats(
-            row,
-            model_name,
-            model_info=model_info,
-            calculate_usage=VertexGeminiConfig.calculate_usage,
-            cost_calculator=batch_cost_calculator,
-            vertex_location=vertex_location,
+    observations: Final = tuple(
+        (
+            native_vertex_batch_row_model(row, model_name),
+            native_vertex_batch_row_stats(
+                row,
+                model_name,
+                model_info=model_info,
+                calculate_usage=VertexGeminiConfig.calculate_usage,
+                cost_calculator=batch_cost_calculator,
+                vertex_location=vertex_location,
+            ),
         )
         for row in vertex_ai_batch_responses
     )
+    row_stats: Final = tuple(stats for _, stats in observations)
     priced: Final = tuple(stats for stats in row_stats if stats is not None)
     total_prompt_cost: Final = sum(stats.prompt_cost for stats in priced)
     total_completion_cost: Final = sum(stats.completion_cost for stats in priced)
@@ -479,7 +493,10 @@ def calculate_vertex_ai_batch_cost_and_usage(
             total_tokens=total_tokens,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
-            batch_usage_by_model=_batch_usage_by_model(tuple((stats.model, stats.usage) for stats in priced)),
+            batch_usage_by_model=_batch_usage_by_model(
+                tuple((model, stats.usage if stats is not None else None) for model, stats in observations)
+            ),
+            batch_unknown_usage_requests=sum(stats is None for stats in row_stats),
         ),
         models=(
             [model_name]
